@@ -8,8 +8,9 @@ Notes:
       of the {Model}ForCausalLM API that enables dispatch to the underlying LLM's `generate` utilities (feeding inputs
       through our custom projection shim).
 """
-
 from __future__ import annotations
+from .kv_cache_manager import KVCacheManager, SequentialRNNGate, aggregate_mean
+
 
 from functools import partial
 from pathlib import Path
@@ -111,6 +112,130 @@ class PrismaticVLM(VLM):
         self.trainable_module_keys = []
 
         self.initialize_weights()
+        
+       # --- KV-Efficient Attention ---
+        d_k = llm_backbone.embed_dim // llm_backbone.llm.config.num_attention_heads   # Head dim
+        self.kv_rnn_gate = SequentialRNNGate(input_dim=d_k, hidden_dim=16)
+        self.kv_cache_manager = KVCacheManager(
+            window_size=100,    # <--- Set to your W
+            chunk_size=16,       # <--- Set to your C
+            aggregate_fn=aggregate_mean,
+            rnn_gate=self.kv_rnn_gate,
+            threshold=0.5,       # <--- Set to your α
+        )
+        self.kv_h_states = None    # Holds per-layer hidden state during decoding
+        self.kv_buffers = None     # Holds per-layer buffer during decoding
+        self.kv_caches = None      # Holds per-layer cache during decoding
+
+    def compress_past_key_values(self, past_key_values):
+        # past_key_values: list of (k, v), each [B, H, T, d_k]
+        compressed_past_key_values = []
+        num_layers = len(past_key_values)
+        # self.kv_h_states = [torch.zeros(1, 1, self.kv_rnn_gate.rnn.hidden_size, device=past_key_values[0][0].device) for _ in range(num_layers)]
+        self.kv_h_states = [
+    (
+        torch.zeros(1, 1, self.kv_rnn_gate.rnn.hidden_size, device=past_key_values[0][0].device),  # h
+        torch.zeros(1, 1, self.kv_rnn_gate.rnn.hidden_size, device=past_key_values[0][0].device),  # c
+    )
+    for _ in range(num_layers)
+]
+        for l, (k, v) in enumerate(past_key_values):
+            B, H, T, d_k = k.shape
+            k_new_list, v_new_list = [], []
+            h_state = self.kv_h_states[l]
+            for b in range(B):
+                for h in range(H):
+                    seq_K = k[b, h]  # [T, d_k]
+                    seq_V = v[b, h]
+                    k_comp, h_state = self.kv_cache_manager.compress_prefill_kv(seq_K, h_state)
+                    v_comp, _ = self.kv_cache_manager.compress_prefill_kv(seq_V, h_state)
+                    k_new_list.append(k_comp)
+                    v_new_list.append(v_comp)
+            self.kv_h_states[l] = h_state
+            # pad to max length
+            # T_max = max(x.shape[0] for x in k_new_list)
+            # def pad_to(x, T):
+            #     pad = T - x.shape[0]
+            #     if pad > 0:
+            #         return torch.cat([x, torch.zeros(pad, x.shape[1], device=x.device, dtype=x.dtype)], dim=0)
+            #     return x
+            # k_new_list_pad = [pad_to(x, T_max) for x in k_new_list]
+            # v_new_list_pad = [pad_to(x, T_max) for x in v_new_list]
+            # k_new = torch.stack(k_new_list_pad, dim=0).reshape(B, H, T_max, d_k)
+            # v_new = torch.stack(v_new_list_pad, dim=0).reshape(B, H, T_max, d_k)
+            # compressed_past_key_values.append((k_new, v_new))
+            T_max_k = max(x.shape[0] for x in k_new_list)
+            T_max_v = max(x.shape[0] for x in v_new_list)
+            T_max = max(T_max_k, T_max_v)
+            
+            def pad_to(x, T):
+                pad = T - x.shape[0]
+                assert pad >= 0, f"Negative pad: {pad}, x.shape[0]={x.shape[0]}, T={T}"
+                if pad > 0:
+                    return torch.cat([x, torch.zeros(pad, x.shape[1], device=x.device, dtype=x.dtype)], dim=0)
+                return x
+            
+            k_new_list_pad = [pad_to(x, T_max) for x in k_new_list]
+            v_new_list_pad = [pad_to(x, T_max) for x in v_new_list]
+
+            
+            # for i, x in enumerate(v_new_list_pad):
+            #     print(f"Entry {i}: v_new_list_pad.shape={x.shape}")
+            # assert all(x.shape == (T_max, d_k) for x in v_new_list_pad), "Padding failed"
+            
+            k_new = torch.stack(k_new_list_pad, dim=0).reshape(B, H, T_max, d_k)
+            v_new = torch.stack(v_new_list_pad, dim=0).reshape(B, H, T_max, d_k)
+            compressed_past_key_values.append((k_new, v_new))
+        return compressed_past_key_values
+
+    def update_past_key_values(self, past_key_values, input_ids):
+        # Called at every decode step (input_ids.shape[1] == 1)
+        num_layers = len(past_key_values)
+        if self.kv_h_states is None:
+            # self.kv_h_states = [torch.zeros(1, 1, self.kv_rnn_gate.rnn.hidden_size, device=past_key_values[0][0].device) for _ in range(num_layers)]
+            self.kv_h_states = [
+    (
+        torch.zeros(1, 1, self.kv_rnn_gate.rnn.hidden_size, device=past_key_values[0][0].device),  # h
+        torch.zeros(1, 1, self.kv_rnn_gate.rnn.hidden_size, device=past_key_values[0][0].device),  # c
+    )
+    for _ in range(num_layers)
+]
+        if self.kv_buffers is None:
+            self.kv_buffers = [[] for _ in range(num_layers)]
+            self.kv_caches = [[] for _ in range(num_layers)]
+        updated_past_key_values = []
+        for l, (k, v) in enumerate(past_key_values):
+            B, H, T, d_k = k.shape
+            h_state = self.kv_h_states[l]
+            buffer = self.kv_buffers[l]
+            cache = self.kv_caches[l]
+            for b in range(B):
+                for h in range(H):
+                    new_kv = k[b, h, -1]  # last token
+                    cache, h_state, buffer = self.kv_cache_manager.online_update(cache, new_kv, h_state, buffer)
+            self.kv_h_states[l] = h_state
+            self.kv_buffers[l] = buffer
+            self.kv_caches[l] = cache
+            # pad
+            T_cur = len(cache)
+            if T_cur == 0:
+                T_cur = 1
+                cache_padded = torch.zeros(T_cur, d_k, device=k.device)
+            else:
+                cache_padded = torch.stack([x for x in cache], dim=0)
+            k_new = cache_padded.unsqueeze(0).unsqueeze(0).expand(B, H, T_cur, d_k)
+            v_new = k_new.clone()  # In real use, update with v as well
+            updated_past_key_values.append((k_new, v_new))
+        return updated_past_key_values
+
+    def reset_kv_states(self):
+        self.kv_h_states = None
+        self.kv_buffers = None
+        self.kv_caches = None
+
+
+    
+
 
     def initialize_weights(self):
         # Initialize transformer layers:
@@ -502,12 +627,20 @@ class PrismaticVLM(VLM):
         Returns:
             Output from LLM backbone if cache is used
         """
+
+        
         if input_ids.shape[1] == 1 and past_key_values is not None:
+
+            # Integrate your efficient update here!
+            past_key_values = self.update_past_key_values(past_key_values, input_ids)
+
             return self.llm_backbone(
                 input_ids=input_ids,
                 past_key_values=past_key_values,
                 **{k: v for k, v in kwargs.items() if v is not None}
             )
+
+
         elif past_key_values is not None and self.use_diff and not gen_discret_action and not ar_infer:
             t = self.t_embedder(t).unsqueeze(1) if t is not None else None
             x = self.x_embedder(x)
@@ -678,6 +811,7 @@ class PrismaticVLM(VLM):
         Returns:
             Model output with optional additional information
         """
+        
         # Store local flags
         self.gen_discret_action = gen_discret_action
         
@@ -765,9 +899,10 @@ class PrismaticVLM(VLM):
             fused_embeddings = torch.vstack([multimodal_embeddings, unimodal_embeddings])
             fused_attention_mask = torch.vstack([multimodal_attention_mask, unimodal_attention_mask])
             fused_labels = torch.vstack([multimodal_labels, unimodal_labels])
-
-        # Run LLM forward pass
-        output: CausalLMOutputWithPast = self.llm_backbone(
+        
+        if past_key_values is None and input_ids is not None and input_ids.shape[1] > 1:
+            # Do prefill (context) pass with LLM backbone
+            output: CausalLMOutputWithPast = self.llm_backbone(
             input_ids=None,
             attention_mask=fused_attention_mask,
             past_key_values=past_key_values,
@@ -778,6 +913,27 @@ class PrismaticVLM(VLM):
             return_dict=return_dict,
             **{k: v for k, v in kwargs.items() if v is not None}
         )
+            # Compress initial past_key_values
+            compressed_past_key_values = self.compress_past_key_values(output.past_key_values)
+            # Overwrite output.past_key_values with compressed version
+            output.past_key_values = compressed_past_key_values
+            # Now you can either:
+            #   - Return (output, compressed_past_key_values) if you want to handle further steps externally
+            #   - Or, just return output (with compressed cache stored in output.past_key_values)
+        else:
+            
+            # Run LLM forward pass
+            output: CausalLMOutputWithPast = self.llm_backbone(
+                input_ids=None,
+                attention_mask=fused_attention_mask,
+                past_key_values=past_key_values,
+                inputs_embeds=fused_embeddings,
+                labels=fused_labels,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
+                **{k: v for k, v in kwargs.items() if v is not None}
+            )
         
         # Handle action output for differential mode
         if self.use_diff and not gen_discret_action and not ar_infer:
@@ -911,6 +1067,8 @@ class PrismaticVLM(VLM):
                     string_probs_unnormalized = token_probs[slice_idxs]
                     string_probs = string_probs_unnormalized / string_probs_unnormalized.sum()
                     gen_probabilities.append(string_probs.cpu().numpy().tolist())
+        
+        self.reset_kv_states()
 
         return gen_texts if return_string_probabilities is None else gen_probabilities
 
@@ -941,5 +1099,5 @@ class PrismaticVLM(VLM):
             # fmt: on
 
         generated_text = tokenizer.decode(generated_ids[0, input_ids.shape[1] :], skip_special_tokens=True).strip()
-
+        self.reset_kv_states()  
         return generated_text
