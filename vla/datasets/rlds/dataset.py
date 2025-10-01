@@ -127,11 +127,14 @@ def make_dataset_from_rlds(
         - action                        # action vector
         - dataset_name                  # name of the dataset
     """
+    # state_obs_keys=['state']
     REQUIRED_KEYS = {"observation", "action"}
     if language_key is not None:
         REQUIRED_KEYS.add(language_key)
 
     def restructure(traj):
+        print("DEBUG: traj keys:", traj.keys())
+        print("DEBUG: traj['observation'] keys:", traj['observation'].keys())
         # apply a standardization function, if provided
         if standardize_fn is not None:
             traj = standardize_fn(traj)
@@ -170,9 +173,12 @@ def make_dataset_from_rlds(
                 ],
                 axis=1,
             )
+            new_obs["proprio"] = new_obs["proprio"][:, :7]
 
+        # print("D",new_obs["proprio"].shape)
         # add timestep info
         new_obs["timestep"] = tf.range(traj_len)
+        
         # new_obs["proprio"] = tf.cast(traj["observation"]["proprio"], tf.float32)
 
         # extracts `language_key` into the "task" dict
@@ -201,18 +207,33 @@ def make_dataset_from_rlds(
                 tf.convert_to_tensor(absolute_action_mask, dtype=tf.bool)[None],
                 [traj_len, 1],
             )
-        
+        print("DEBUG: traj keys:", traj.keys())
+        print("DEBUG: traj['observation'] keys:", traj['observation'].keys())
+
+        # print("DEBUG: traj['observation']['proprio']:", traj["observation"]["proprio"])
+        # absolute_proprio_mask = [True] * 8
         if absolute_proprio_mask is not None:
-            if len(absolute_proprio_mask) != traj["proprio"].shape[-1]:
+            if len(absolute_proprio_mask) != traj["observation"]["proprio"].shape[-1]:
                 raise ValueError(
                     f"Length of absolute_proprio_mask ({len(absolute_proprio_mask)}) "
-                    f"does not match action dimension ({traj['proprio'].shape[-1]})."
+                    f"does not match action dimension ({traj['observation']['proprio'].shape[-1]})."
                 )
             traj["absolute_proprio_mask"] = tf.tile(
                 tf.convert_to_tensor(absolute_proprio_mask, dtype=tf.bool)[None],
                 [traj_len, 1],
             )
-
+        # === PATCHED PART ===
+        # if absolute_proprio_mask is not None and "proprio" in new_obs:
+        #     if len(absolute_proprio_mask) != new_obs["proprio"].shape[-1]:
+        #         raise ValueError(
+        #             f"Length of absolute_proprio_mask ({len(absolute_proprio_mask)}) "
+        #             f"does not match proprio dimension ({new_obs['proprio'].shape[-1]})."
+        #         )
+        #     traj["absolute_proprio_mask"] = tf.tile(
+        #         tf.convert_to_tensor(absolute_proprio_mask, dtype=tf.bool)[None],
+        #         [traj_len, 1],
+        #     )
+        # ====================
         return traj
 
     builder = tfds.builder(name, data_dir=data_dir)
@@ -468,6 +489,8 @@ def make_single_dataset(
         traj_transform_kwargs: kwargs passed to 'apply_trajectory_transforms'.
         frame_transform_kwargs: kwargs passed to 'get_frame_transforms'.
     """
+    #####change state_obs_keys#####
+    data_kwargs['state_obs_keys'] = ['state']
     dataset, dataset_statistics = make_dataset_from_rlds(
         **dataset_kwargs,
         train=train,
@@ -537,7 +560,9 @@ def make_interleaved_dataset(
         data_kwargs = copy.deepcopy(dataset_kwargs)
         if "dataset_frame_transform_kwargs" in data_kwargs:
             data_kwargs.pop("dataset_frame_transform_kwargs")
-        _, dataset_statistics = make_dataset_from_rlds(**data_kwargs, train=train, load_all_data_for_training=load_all_data_for_training)
+        #####change state_obs_keys#####
+        data_kwargs['state_obs_keys'] = ['state']
+        _, dataset_statistics = make_dataset_from_rlds(**data_kwargs, train=train,load_all_data_for_training=load_all_data_for_training)
         dataset_sizes.append(dataset_statistics["num_transitions"])
         all_dataset_statistics[dataset_kwargs["name"]] = dataset_statistics
 
@@ -574,6 +599,8 @@ def make_interleaved_dataset(
             if "dataset_frame_transform_kwargs" in dataset_kwargs
             else {}
         )
+        ##### change state_obs_keys#####
+        data_kwargs['state_obs_keys'] = ['state']
         dataset, _ = make_dataset_from_rlds(
             **dataset_kwargs,
             train=train,

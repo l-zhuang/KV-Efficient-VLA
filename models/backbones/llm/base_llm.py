@@ -108,7 +108,7 @@ class HFCausalLLMBackbone(LLMBackbone, ABC):
         llm_max_length: int = 2048,
         hf_token: Optional[str] = None,
         inference_mode: bool = False,
-        use_flash_attention_2: bool = False,
+        use_flash_attention_2: bool = True,
     ) -> None:
         super().__init__(llm_backbone_id)
         self.llm_family = llm_family
@@ -123,7 +123,11 @@ class HFCausalLLMBackbone(LLMBackbone, ABC):
                 hf_hub_path,
                 token=hf_token,
                 use_flash_attention_2=use_flash_attention_2 if not self.inference_mode else False,
+                # use_flash_attention_2=False,
                 # The following parameters are set to prevent `UserWarnings` from HF; we want greedy decoding!
+                # attn_implementation="flash_attention_2" if (use_flash_attention_2 and not self.inference_mode) else "eager",
+                # torch_dtype=torch.bfloat16,   # or torch.float16, depending on your GPU
+                # device_map="auto",            # or .to("cuda") manually later
                 do_sample=False,
                 temperature=1.0,
                 top_p=1.0,

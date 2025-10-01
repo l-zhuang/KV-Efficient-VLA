@@ -9,6 +9,8 @@ from typing import Dict, List, Tuple
 
 # fmt: off
 OXE_NAMED_MIXTURES: Dict[str, List[Tuple[str, float]]] = {
+    "berkeley_gnm_sac_son": [("berkeley_gnm_sac_son", 1.0)],
+     "austin_buds_dataset_converted_externally_to_rlds": [("austin_buds_dataset_converted_externally_to_rlds", 1.0)],
     # === Bridge V2 Dataset ===
     "bridge": [
         # ("bridge_oxe", 1.0),                                    # Version of Bridge V2 in Open-X GCP Bucket

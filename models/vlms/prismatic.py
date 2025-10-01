@@ -911,12 +911,17 @@ class PrismaticVLM(VLM):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
+   
             **{k: v for k, v in kwargs.items() if v is not None}
         )
-            # Compress initial past_key_values
-            compressed_past_key_values = self.compress_past_key_values(output.past_key_values)
-            # Overwrite output.past_key_values with compressed version
-            output.past_key_values = compressed_past_key_values
+            if output.past_key_values is not None:
+                compressed_past_key_values = self.compress_past_key_values(output.past_key_values)
+                output.past_key_values = compressed_past_key_values
+            else:
+                # Optionally warn or handle differently
+                print("Warning: LLM backbone did not return past_key_values.")
+
+    
             # Now you can either:
             #   - Return (output, compressed_past_key_values) if you want to handle further steps externally
             #   - Or, just return output (with compressed cache stored in output.past_key_values)

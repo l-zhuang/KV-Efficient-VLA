@@ -82,8 +82,9 @@ class TrainConfig:
     hf_token: Union[str, Path] = Path(".hf_token")                  # Environment variable or Path to HF Token
 
     # Tracking Parameters
-    trackers: Tuple[str, ...] = ("jsonl", "wandb")                  # Trackers to initialize (if W&B, add config!)
-    #trackers: Tuple[str, ...] = ("jsonl",)                         # Trackers to initialize (if W&B, add config!)
+   
+    # trackers: Tuple[str, ...] = ("jsonl", "wandb")                  # Trackers to initialize (if W&B, add config!)
+    trackers: Tuple[str, ...] = ("jsonl",)                         # Trackers to initialize (if W&B, add config!)
     wandb_project: str = ""                                         # Name of W&B project to log to (use default!)
     wandb_entity: str = ""                                          # Name of entity to log under
     repeated_diffusion_steps: int = 8                               # Repeated steps for training action model (a diffusion model)
@@ -234,6 +235,12 @@ def train(cfg: TrainConfig) -> None:
     # [Validate] Model should be in Full Precision!
     for param in vla.parameters():
         assert param.dtype == torch.float32, f"Loaded VLM parameter not in full precision: {param}"
+    # use_fa2 = True  # or derive from your config
+    # allowed = {torch.float16, torch.bfloat16} if use_fa2 else {torch.float32}
+    # bad = [(n, p.dtype) for n, p in vla.named_parameters() if p.dtype not in allowed]
+    # if bad:
+    #     raise AssertionError(f"Unexpected dtypes for FA2={use_fa2}: {bad[:3]}{'...' if len(bad)>3 else ''}")
+
 
     # Determine training "stage" based on frozen vs unfrozen parameters --> supports different fine-tuning schemes!
     if not cfg.vla.freeze_vision_backbone and not cfg.vla.freeze_llm_backbone:
@@ -316,6 +323,7 @@ def train(cfg: TrainConfig) -> None:
     if cfg.pretrained_checkpoint is not None and cfg.is_resume:
         train_strategy.load_optimizer_and_scheduler(cfg.pretrained_checkpoint)
 
+    ## Uncomment to see metrics
     # Create Metrics =>> Handles on the fly tracking, logging to specified trackers (e.g., JSONL, Weights & Biases)
     overwatch.info(f"Creating Metrics with Active Trackers => `{cfg.trackers}`")
     metrics = VLAMetrics(
@@ -328,27 +336,30 @@ def train(cfg: TrainConfig) -> None:
         resume_step=cfg.resume_step,
         resume_epoch=cfg.resume_epoch,
     )
+    try:
+        # Main training loop
+        overwatch.info("Starting VLA Training Loop")
+        train_strategy.run_vla_training(
+            vla_dataset,
+            collator,
+            metrics,
+            save_interval=cfg.save_interval,
+            use_diff=cfg.use_diff,
+            repeated_diffusion_steps=cfg.repeated_diffusion_steps,
+            ar_diff_loss=cfg.ar_diff_loss,
+        )
+        overwatch.info("Done with Training =>> Finalizing Metrics")
+        metrics.finalize()
+        overwatch.info("... and that's all, folks!")
+        if dist.is_initialized():
+            dist.barrier()
+    finally:
+        if dist.is_initialized():
+            try:
+                dist.destroy_process_group()
+            except Exception as e:
+                print(f"Error destroying process group: {e}")
 
-    # Run VLA Training
-    overwatch.info("Starting VLA Training Loop")
-    train_strategy.run_vla_training(
-        vla_dataset,
-        collator,
-        metrics,
-        save_interval=cfg.save_interval,
-        use_diff=cfg.use_diff,
-        repeated_diffusion_steps = cfg.repeated_diffusion_steps,
-        ar_diff_loss = cfg.ar_diff_loss,
-    )
-
-    # Finalize
-    overwatch.info("Done with Training =>> Finalizing Metrics")
-    metrics.finalize()
-
-    # And... we're done!
-    overwatch.info("... and that's all, folks!")
-    dist.barrier()
-    dist.destroy_process_group()
 
 
 if __name__ == "__main__":
