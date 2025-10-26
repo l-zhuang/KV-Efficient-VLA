@@ -115,17 +115,19 @@ class PrismaticVLM(VLM):
         
        # --- KV-Efficient Attention ---
         d_k = llm_backbone.embed_dim // llm_backbone.llm.config.num_attention_heads   # Head dim
-        self.kv_rnn_gate = SequentialRNNGate(input_dim=d_k, hidden_dim=16)
+        self.kv_rnn_gate = SequentialRNNGate(input_dim=d_k, hidden_dim=128)
         self.kv_cache_manager = KVCacheManager(
-            window_size=100,    # <--- Set to your W
-            chunk_size=16,       # <--- Set to your C
+            window_size=10,    # <--- Set to your W
+            chunk_size=3136,       # <--- Set to your C
             aggregate_fn=aggregate_mean,
             rnn_gate=self.kv_rnn_gate,
             threshold=0.5,       # <--- Set to your α
         )
         self.kv_h_states = None    # Holds per-layer hidden state during decoding
         self.kv_buffers = None     # Holds per-layer buffer during decoding
+        self.v_buffers = None 
         self.kv_caches = None      # Holds per-layer cache during decoding
+        self.v_caches = None 
 
     def compress_past_key_values(self, past_key_values):
         # past_key_values: list of (k, v), each [B, H, T, d_k]
@@ -189,42 +191,57 @@ class PrismaticVLM(VLM):
         return compressed_past_key_values
 
     def update_past_key_values(self, past_key_values, input_ids):
-        # Called at every decode step (input_ids.shape[1] == 1)
+        
+        # Find the number of layers
         num_layers = len(past_key_values)
+
+        # Initialized hidden state for each layer
         if self.kv_h_states is None:
-            # self.kv_h_states = [torch.zeros(1, 1, self.kv_rnn_gate.rnn.hidden_size, device=past_key_values[0][0].device) for _ in range(num_layers)]
             self.kv_h_states = [
-    (
-        torch.zeros(1, 1, self.kv_rnn_gate.rnn.hidden_size, device=past_key_values[0][0].device),  # h
-        torch.zeros(1, 1, self.kv_rnn_gate.rnn.hidden_size, device=past_key_values[0][0].device),  # c
-    )
-    for _ in range(num_layers)
-]
+                (
+                    torch.zeros(1, 1, self.kv_rnn_gate.rnn.hidden_size, device=past_key_values[0][0].device),  # h
+                    torch.zeros(1, 1, self.kv_rnn_gate.rnn.hidden_size, device=past_key_values[0][0].device),  # c
+                )
+                for _ in range(num_layers)
+            ]
         if self.kv_buffers is None:
             self.kv_buffers = [[] for _ in range(num_layers)]
+            self.v_buffers= [[] for _ in range(num_layers)]
             self.kv_caches = [[] for _ in range(num_layers)]
+            self.v_caches = [[] for _ in range(num_layers)]
         updated_past_key_values = []
+
+        # Iterate through kv cache for each layer        
         for l, (k, v) in enumerate(past_key_values):
             B, H, T, d_k = k.shape
             h_state = self.kv_h_states[l]
             buffer = self.kv_buffers[l]
+            buffer_v = self.v_buffers[l]
             cache = self.kv_caches[l]
+            cache_v = self.v_caches[l]
             for b in range(B):
                 for h in range(H):
                     new_kv = k[b, h, -1]  # last token
-                    cache, h_state, buffer = self.kv_cache_manager.online_update(cache, new_kv, h_state, buffer)
+                    new_v = v[b, h, -1]
+                    cache,cache_v,h_state, buffer,buffer_v = self.kv_cache_manager.online_update(cache, cache_v,new_kv,new_v,h_state, buffer,buffer_v)
             self.kv_h_states[l] = h_state
             self.kv_buffers[l] = buffer
+            self.v_buffers[l] = buffer_v
             self.kv_caches[l] = cache
+            self.v_caches[l] = cache_v
             # pad
             T_cur = len(cache)
             if T_cur == 0:
                 T_cur = 1
                 cache_padded = torch.zeros(T_cur, d_k, device=k.device)
+                cache_padded_v = torch.zeros(T_cur, d_k, device=k.device)
             else:
                 cache_padded = torch.stack([x for x in cache], dim=0)
+                cache_padded_v = torch.stack([x for x in cache_v], dim=0)
+                
             k_new = cache_padded.unsqueeze(0).unsqueeze(0).expand(B, H, T_cur, d_k)
-            v_new = k_new.clone()  # In real use, update with v as well
+            v_new = cache_padded_v.unsqueeze(0).unsqueeze(0).expand(B, H, T_cur, d_k)
+            # v_new = k_new.clone()  # In real use, update with v as well
             updated_past_key_values.append((k_new, v_new))
         return updated_past_key_values
 
@@ -627,12 +644,15 @@ class PrismaticVLM(VLM):
         Returns:
             Output from LLM backbone if cache is used
         """
-
-        
+        print("check")
+        print(input_ids.shape[1])
+        # when autoregressive with kv cache 
         if input_ids.shape[1] == 1 and past_key_values is not None:
 
+            print("################ check ################")
             # Integrate your efficient update here!
             past_key_values = self.update_past_key_values(past_key_values, input_ids)
+            print("################ check ################")
 
             return self.llm_backbone(
                 input_ids=input_ids,
@@ -917,9 +937,7 @@ class PrismaticVLM(VLM):
             if output.past_key_values is not None:
                 compressed_past_key_values = self.compress_past_key_values(output.past_key_values)
                 output.past_key_values = compressed_past_key_values
-            else:
-                # Optionally warn or handle differently
-                print("Warning: LLM backbone did not return past_key_values.")
+           
 
     
             # Now you can either:
@@ -927,7 +945,7 @@ class PrismaticVLM(VLM):
             #   - Or, just return output (with compressed cache stored in output.past_key_values)
         else:
             
-            # Run LLM forward pass
+        # Run LLM forward pass
             output: CausalLMOutputWithPast = self.llm_backbone(
                 input_ids=None,
                 attention_mask=fused_attention_mask,
@@ -939,7 +957,7 @@ class PrismaticVLM(VLM):
                 return_dict=return_dict,
                 **{k: v for k, v in kwargs.items() if v is not None}
             )
-        
+    
         # Handle action output for differential mode
         if self.use_diff and not gen_discret_action and not ar_infer:
             last_hidden = output.hidden_states[-1]
